@@ -2,9 +2,6 @@
 
 Marwatoo's build of st (simple terminal)
 
-![C](https://img.shields.io/badge/C-89.5%25-blue?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-
 ![st screenshot](st.png)
 
 # st - simple terminal
