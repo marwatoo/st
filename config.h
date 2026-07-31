@@ -8,7 +8,7 @@
 static char *font = "JetBrainsMonoNL NFP:size=14:antialias=true:autohint=true:style=Bold";
 /* Spare fonts */
 static char *font2[] = {
-	"Monospace:size=14:antialias=true:autohint=true:style=Bold",
+	"Monospace:size=14:antialias=true:autohint=true:style=Bold", // this fonts supports arabic the best with st
 	"Symbola:size=14:antialias=true:autohint=true,style=Bold", 
 };
 
