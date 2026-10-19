@@ -1,0 +1,263 @@
+diff --git a/config.h b/config.h
+index bf79a4c..1b9fdf3 100644
+--- a/config.h
++++ b/config.h
+@@ -149,6 +149,49 @@ static const char *colorname[] = {
+ 	"black", /* default background colour */
+ };
+ 
++/*
++ * Follow the GNOME light/dark preference
++ * (org.gnome.desktop.interface color-scheme). Set to 0 to always use the
++ * dark palette in colorname[] above.
++ */
++static int followtheme = 1;
++
++/*
++ * Light variant of the palette above (Dracula "Alucard"-style), swapped in
++ * live when GNOME is set to light. Only the indices listed here change; the
++ * dark theme in colorname[] is left exactly as it is.
++ *
++ * Like most light schemes, the roles of the ANSI greys are kept rather than
++ * the literal colours: "white" (7, 15) stays the readable text colour and
++ * "black" (0, 8) stays the dark/dim surface colour, so programs written for
++ * dark terminals remain legible. The accents are darkened for contrast.
++ */
++static const char *colorname_light[] = {
++    /* 8 normal colors */
++    [0] = "#ffffff", /* black   */
++    [1] = "#cb3a2a", /* red     */
++    [2] = "#14710a", /* green   */
++    [3] = "#846e15", /* yellow  */
++    [4] = "#644ac9", /* blue    */
++    [5] = "#a3144d", /* magenta */
++    [6] = "#036a96", /* cyan    */
++    [7] = "#44475a", /* white   */
++
++    /* 8 bright colors */
++    [8]  = "#cfcfde", /* black   */
++    [9]  = "#cb3a2a", /* red     */
++    [10] = "#14710a", /* green   */
++    [11] = "#846e15", /* yellow  */
++    [12] = "#644ac9", /* blue    */
++    [13] = "#a3144d", /* magenta */
++    [14] = "#036a96", /* cyan    */
++    [15] = "#000000", /* white   */
++
++    /* special colors */
++    [256] = "#fffbeb", /* background */
++    [257] = "#1f1f1f", /* foreground */
++};
++
+ 
+ /*
+  * Default colors (colorname index)
+diff --git a/x.c b/x.c
+index f5376ce..571f85e 100644
+--- a/x.c
++++ b/x.c
+@@ -5,6 +5,11 @@
+ #include <locale.h>
+ #include <signal.h>
+ #include <sys/select.h>
++#include <sys/wait.h>
++#include <fcntl.h>
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
+ #include <time.h>
+ #include <unistd.h>
+ #include <libgen.h>
+@@ -2375,6 +2380,156 @@ resize(XEvent *e)
+ 	cresize(e->xconfigure.width, e->xconfigure.height);
+ }
+ 
++/*
++ * Follow the GNOME light/dark preference.
++ *
++ * At startup the current org.gnome.desktop.interface color-scheme is read
++ * with gsettings(1) and the matching palette is selected. A `gsettings
++ * monitor` child then reports changes and the palette is swapped live. If
++ * gsettings is missing or the key does not exist, nothing happens and st
++ * keeps the colours from config.h, so this is harmless on other desktops.
++ */
++static int themefd = -1;   /* read end of the gsettings monitor pipe */
++static pid_t themepid = -1;
++static int themedark = -1; /* -1 unknown, 0 light, 1 dark */
++static const char *colorname_dark[LEN(colorname_light)];
++typedef char themecheck[LEN(colorname) >= LEN(colorname_light) ? 1 : -1];
++
++/* parse a gsettings value: 1 for dark, 0 for light, -1 if not a value */
++static int
++themeparse(const char *s)
++{
++	/* values look like 'default', 'prefer-dark' or 'prefer-light' */
++	if (!strchr(s, '\''))
++		return -1;
++	return strstr(s, "dark") != NULL;
++}
++
++static int
++themequery(void)
++{
++	char buf[128];
++	FILE *f;
++	int dark = -1;
++
++	f = popen("gsettings get org.gnome.desktop.interface color-scheme"
++	          " 2>/dev/null", "r");
++	if (!f)
++		return -1;
++	if (fgets(buf, sizeof(buf), f))
++		dark = themeparse(buf);
++	pclose(f);
++	return dark;
++}
++
++static void
++themeapply(int dark)
++{
++	size_t i;
++
++	for (i = 0; i < LEN(colorname_light); i++)
++		if (colorname_light[i])
++			colorname[i] = dark ? colorname_dark[i] : colorname_light[i];
++	themedark = dark;
++}
++
++/* switch palette of an already open window */
++static void
++themechange(int dark)
++{
++	themeapply(dark);
++	xloadcols();
++	XSetWindowBackground(xw.dpy, xw.win, dc.col[defaultbg].pixel);
++	XSetForeground(xw.dpy, dc.gc,
++			dc.col[IS_SET(MODE_REVERSE) ? defaultfg : defaultbg].pixel);
++	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
++	redraw();
++}
++
++/* the monitor pipe is readable: read its lines, apply the newest value */
++static void
++themeevent(void)
++{
++	static char buf[256];
++	static size_t len;
++	char *nl;
++	ssize_t n;
++	int dark = -1, d;
++
++	n = read(themefd, buf + len, sizeof(buf) - len - 1);
++	if (n < 0 && (errno == EAGAIN || errno == EINTR))
++		return;
++	if (n <= 0) { /* monitor went away: stop following, keep the colours */
++		close(themefd);
++		themefd = -1;
++		waitpid(themepid, NULL, WNOHANG);
++		return;
++	}
++	len += n;
++
++	while ((nl = memchr(buf, '\n', len))) {
++		*nl = '\0';
++		if ((d = themeparse(buf)) >= 0)
++			dark = d;
++		len -= nl + 1 - buf;
++		memmove(buf, nl + 1, len);
++	}
++	if (len >= sizeof(buf) - 1) /* overlong line, drop it */
++		len = 0;
++
++	if (dark >= 0 && dark != themedark)
++		themechange(dark);
++}
++
++/* call after config_init() and before xinit() */
++static void
++themeinit(void)
++{
++	int fds[2], nullfd, dark;
++
++	if (!followtheme)
++		return;
++
++	/* keep the dark palette, including Xresources overrides */
++	memcpy(colorname_dark, colorname, sizeof(colorname_dark));
++
++	if ((dark = themequery()) < 0)
++		return;
++	themeapply(dark);
++
++	if (pipe(fds) < 0)
++		return;
++	switch ((themepid = fork())) {
++	case -1:
++		close(fds[0]);
++		close(fds[1]);
++		themepid = -1;
++		return;
++	case 0:
++		close(fds[0]);
++		dup2(fds[1], STDOUT_FILENO);
++		close(fds[1]);
++		if ((nullfd = open("/dev/null", O_RDWR)) >= 0) {
++			dup2(nullfd, STDIN_FILENO);
++			dup2(nullfd, STDERR_FILENO);
++			if (nullfd > STDERR_FILENO)
++				close(nullfd);
++		}
++#ifdef __linux__
++		/* don't leave the monitor behind when st exits */
++		prctl(PR_SET_PDEATHSIG, SIGTERM);
++#endif
++		execlp("gsettings", "gsettings", "monitor",
++		       "org.gnome.desktop.interface", "color-scheme",
++		       (char *)NULL);
++		_exit(1);
++	}
++	close(fds[1]);
++	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
++	fcntl(fds[0], F_SETFL, O_NONBLOCK);
++	themefd = fds[0];
++}
++
+ void
+ run(void)
+ {
+@@ -2408,6 +2563,8 @@ run(void)
+ 		FD_ZERO(&rfd);
+ 		FD_SET(ttyfd, &rfd);
+ 		FD_SET(xfd, &rfd);
++		if (themefd >= 0)
++			FD_SET(themefd, &rfd);
+ 
+ 		if (XPending(xw.dpy))
+ 			timeout = 0;  /* existing events might not set xfd */
+@@ -2416,7 +2573,7 @@ run(void)
+ 		seltv.tv_nsec = 1E6 * (timeout - 1E3 * seltv.tv_sec);
+ 		tv = timeout >= 0 ? &seltv : NULL;
+ 
+-		if (pselect(MAX(xfd, ttyfd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
++		if (pselect(MAX(MAX(xfd, ttyfd), themefd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
+ 			if (errno == EINTR)
+ 				continue;
+ 			die("select failed: %s\n", strerror(errno));
+@@ -2426,6 +2583,9 @@ run(void)
+ 		if (FD_ISSET(ttyfd, &rfd))
+ 			ttyread();
+ 
++		if (themefd >= 0 && FD_ISSET(themefd, &rfd))
++			themeevent();
++
+ 		xev = 0;
+ 		while (XPending(xw.dpy)) {
+ 			xev = 1;
+@@ -2609,6 +2769,7 @@ run:
+ 		die("Can't open display\n");
+ 
+ 	config_init();
++	themeinit();
+ 	cols = MAX(cols, 1);
+ 	rows = MAX(rows, 1);
+ 	tnew(cols, rows);

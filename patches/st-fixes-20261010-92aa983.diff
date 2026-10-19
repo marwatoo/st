@@ -1,0 +1,68 @@
+diff --git a/config.h b/config.h
+index 1b9fdf3..62994f5 100644
+--- a/config.h
++++ b/config.h
+@@ -9,7 +9,7 @@ static char *font = "JetBrainsMonoNL NFP:size=14:antialias=true:autohint=true:st
+ /* Spare fonts */
+ static char *font2[] = {
+ 	"Monospace:size=14:antialias=true:autohint=true:style=Bold", // this fonts supports arabic the best with st
+-	"Symbola:size=14:antialias=true:autohint=true,style=Bold", 
++	"Symbola:size=14:antialias=true:autohint=true:style=Bold",
+ };
+ 
+ static int borderpx = 2;
+@@ -141,12 +141,9 @@ static const char *colorname[] = {
+     /* special colors */
+     [256] = "#282a36", /* background */
+     [257] = "#f8f8f2", /* foreground */
++    [258] = "#f8f8f2", /* cursor */
+ 
+-	/* more colors can be added after 255 to use with DefaultXX */
+-	"#cccccc",
+-	"#555555",
+-	"gray90", /* default foreground colour */
+-	"black", /* default background colour */
++	/* more colors can be added after 258 to use with DefaultXX */
+ };
+ 
+ /*
+@@ -190,6 +187,7 @@ static const char *colorname_light[] = {
+     /* special colors */
+     [256] = "#fffbeb", /* background */
+     [257] = "#1f1f1f", /* foreground */
++    [258] = "#1f1f1f", /* cursor */
+ };
+ 
+ 
+@@ -199,16 +197,8 @@ static const char *colorname_light[] = {
+  */
+ unsigned int defaultfg = 257;
+ unsigned int defaultbg = 256;
+-unsigned int defaultcs = 257;
+-static unsigned int defaultrcs = 257;
+-
+-/*
+- * Colors used, when the specific fg == defaultfg. So in reverse mode this
+- * will reverse too. Another logic would only make the simple feature too
+- * complex.
+- */
+-unsigned int defaultitalic = 7;
+-unsigned int defaultunderline = 7;
++unsigned int defaultcs = 258;
++static unsigned int defaultrcs = 258;
+ 
+ /*
+  * Default shape of cursor
+@@ -247,9 +237,9 @@ ResourcePref resources[] = {
+ 		{ "color13",      STRING,  &colorname[13] },
+ 		{ "color14",      STRING,  &colorname[14] },
+ 		{ "color15",      STRING,  &colorname[15] },
+-		{ "background",   STRING,  &colorname[259] },
+-		{ "foreground",   STRING,  &colorname[258] },
+-		{ "cursorColor",  STRING,  &colorname[256] },
++		{ "background",   STRING,  &colorname[256] },
++		{ "foreground",   STRING,  &colorname[257] },
++		{ "cursorColor",  STRING,  &colorname[258] },
+ 		{ "termname",     STRING,  &termname },
+ 		{ "shell",        STRING,  &shell },
+ 		{ "minlatency",   INTEGER, &minlatency },

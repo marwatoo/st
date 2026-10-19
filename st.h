@@ -12,13 +12,16 @@
 #define DEFAULT(a, b)		(a) = (a) ? (a) : (b)
 #define LIMIT(x, a, b)		(x) = (x) < (a) ? (a) : (x) > (b) ? (b) : (x)
 #define ATTRCMP(a, b)		((a).mode != (b).mode || (a).fg != (b).fg || \
-				(a).bg != (b).bg)
+				(a).bg != (b).bg || (a).ul != (b).ul)
 #define TIMEDIFF(t1, t2)	((t1.tv_sec-t2.tv_sec)*1000 + \
 				(t1.tv_nsec-t2.tv_nsec)/1E6)
 #define MODBIT(x, set, bit)	((set) ? ((x) |= (bit)) : ((x) &= ~(bit)))
 
 #define TRUECOLOR(r,g,b)	(1 << 24 | (r) << 16 | (g) << 8 | (b))
 #define IS_TRUECOL(x)		(1 << 24 & (x))
+/* underline colour (SGR 58): 0 = same as foreground, else palette index
+ * tagged with UL_IDX, or a TRUECOLOR() value */
+#define UL_IDX			(1 << 25)
 
 #define HEX_TO_INT(c)		((c) >= '0' && (c) <= '9' ? (c) - '0' : \
 				(c) >= 'a' && (c) <= 'f' ? (c) - 'a' + 10 : \
@@ -37,6 +40,11 @@ enum glyph_attribute {
 	ATTR_WRAP       = 1 << 8,
 	ATTR_WIDE       = 1 << 9,
 	ATTR_WDUMMY     = 1 << 10,
+	ATTR_UCURLY     = 1 << 11, /* underline styles, used with ATTR_UNDERLINE */
+	ATTR_UDOUBLE    = 1 << 12,
+	ATTR_UDOTTED    = 1 << 13,
+	ATTR_UDASHED    = 1 << 14,
+	ATTR_USTYLE     = ATTR_UCURLY | ATTR_UDOUBLE | ATTR_UDOTTED | ATTR_UDASHED,
 	ATTR_BOLD_FAINT = ATTR_BOLD | ATTR_FAINT,
 };
 
@@ -69,6 +77,7 @@ typedef struct {
 	ushort mode;      /* attribute flags */
 	uint32_t fg;      /* foreground  */
 	uint32_t bg;      /* background  */
+	uint32_t ul;      /* underline colour, 0 = foreground */
 } Glyph;
 
 typedef Glyph *Line;
@@ -112,6 +121,7 @@ void selstart(int, int, int);
 void selextend(int, int, int, int);
 int selected(int, int);
 char *getsel(void);
+char *tgeturl(int, int);
 
 size_t utf8encode(Rune, char *);
 

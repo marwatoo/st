@@ -145,6 +145,7 @@ typedef struct {
 	size_t len;            /* raw string length */
 	char priv;
 	int arg[ESC_ARG_SIZ];
+	char sub[ESC_ARG_SIZ]; /* arg followed a ':' (sub-parameter) */
 	int narg;              /* nb of args */
 	char mode[2];
 } CSIEscape;
@@ -195,7 +196,7 @@ static void tputc(Rune);
 static void treset(void);
 static void tscrollup(int, int, int);
 static void tscrolldown(int, int, int);
-static void tsetattr(const int *, int);
+static void tsetattr(const int *, const char *, int);
 static void tsetchar(Rune, const Glyph *, int, int);
 static void tsetdirt(int, int);
 static void tsetscroll(int, int);
@@ -1046,6 +1047,170 @@ treset(void)
 	}
 }
 
+/*
+ * URL detection on the visible screen (used by the open-URL bindings).
+ */
+static const char *urlschemes[] = { "https://", "http://", "ftp://", "file://" };
+
+static int
+urlalnum(Rune u)
+{
+	return BETWEEN(u, '0', '9') || BETWEEN(u, 'a', 'z') || BETWEEN(u, 'A', 'Z');
+}
+
+static int
+urlchar(Rune u)
+{
+	return u > 0x20 && u != 0x7f && !BETWEEN(u, 0x80, 0x9f) &&
+	       u != '<' && u != '>' && u != '"' && u != '`' && u != '\\';
+}
+
+/* length of the URL scheme at the start of s, 0 if there is none */
+static size_t
+urlprefix(const Rune *s, size_t n)
+{
+	size_t i, k;
+	Rune c;
+
+	for (i = 0; i < LEN(urlschemes); i++) {
+		for (k = 0; urlschemes[i][k] && k < n; k++) {
+			c = s[k];
+			if (BETWEEN(c, 'A', 'Z'))
+				c += 'a' - 'A';
+			if (c != (Rune)urlschemes[i][k])
+				break;
+		}
+		if (!urlschemes[i][k])
+			return k;
+	}
+	return 0;
+}
+
+/*
+ * Find the URL covering index cidx in s, or the last URL if cidx < 0.
+ * Returns a newly allocated UTF-8 string, or NULL.
+ */
+static char *
+urlscan(const Rune *s, size_t n, long cidx)
+{
+	size_t i = 0, j, k, plen, fi = 0, fj = 0;
+	int found = 0, open, close;
+	Rune c;
+	char *url, *p;
+
+	while (i < n) {
+		if ((i > 0 && urlalnum(s[i - 1])) ||
+		    !(plen = urlprefix(s + i, n - i))) {
+			i++;
+			continue;
+		}
+		for (j = i + plen; j < n && urlchar(s[j]); j++)
+			;
+		/* trailing punctuation and unbalanced closing brackets */
+		while (j > i + plen) {
+			c = s[j - 1];
+			if (c == '.' || c == ',' || c == ';' || c == ':' ||
+			    c == '!' || c == '?' || c == '\'') {
+				j--;
+			} else if (c == ')' || c == ']' || c == '}') {
+				open = close = 0;
+				for (k = i; k < j; k++) {
+					if (s[k] == c - (c == ')' ? 1 : 2))
+						open++;
+					else if (s[k] == c)
+						close++;
+				}
+				if (close <= open)
+					break;
+				j--;
+			} else {
+				break;
+			}
+		}
+		if (j > i + plen) {
+			if (cidx < 0) {
+				fi = i, fj = j, found = 1;
+			} else if ((long)i <= cidx && cidx < (long)j) {
+				fi = i, fj = j, found = 1;
+				break;
+			}
+		}
+		i = MAX(j, i + 1);
+	}
+	if (!found)
+		return NULL;
+
+	url = p = xmalloc((fj - fi) * UTF_SIZ + 1);
+	for (k = fi; k < fj; k++)
+		p += utf8encode(s[k], p);
+	*p = '\0';
+	return url;
+}
+
+/* the logical (wrapped) line containing screen row y, as runes */
+static Rune *
+tgather(int y, int *y0, int *y1, int cx, long *cidx, size_t *len)
+{
+	Rune *buf;
+	Glyph *g;
+	size_t n = 0;
+	int r, c;
+
+	*y0 = *y1 = y;
+	while (*y0 > 0 && (TLINE(*y0 - 1)[term.col - 1].mode & ATTR_WRAP))
+		(*y0)--;
+	while (*y1 < term.row - 1 && (TLINE(*y1)[term.col - 1].mode & ATTR_WRAP))
+		(*y1)++;
+
+	buf = xmalloc((*y1 - *y0 + 1) * term.col * sizeof(Rune));
+	for (r = *y0; r <= *y1; r++) {
+		for (c = 0; c < term.col; c++) {
+			g = &TLINE(r)[c];
+			if (g->mode & ATTR_WDUMMY) {
+				if (r == y && c == cx && n > 0)
+					*cidx = n - 1;
+				continue;
+			}
+			if (r == y && c == cx)
+				*cidx = n;
+			buf[n++] = g->u ? g->u : ' ';
+		}
+	}
+	*len = n;
+	return buf;
+}
+
+/*
+ * URL at screen cell (x, y); with y < 0 the last URL on the screen.
+ * Returns a newly allocated string or NULL.
+ */
+char *
+tgeturl(int x, int y)
+{
+	Rune *buf;
+	char *url = NULL;
+	long cidx = -1;
+	size_t n;
+	int y0, y1;
+
+	if (y >= 0) {
+		if (y >= term.row || x < 0 || x >= term.col)
+			return NULL;
+		buf = tgather(y, &y0, &y1, x, &cidx, &n);
+		if (cidx >= 0)
+			url = urlscan(buf, n, cidx);
+		free(buf);
+		return url;
+	}
+
+	for (y = term.row - 1; y >= 0 && !url; y = y0 - 1) {
+		buf = tgather(y, &y0, &y1, -1, &cidx, &n);
+		url = urlscan(buf, n, -1);
+		free(buf);
+	}
+	return url;
+}
+
 void
 tnew(int col, int row)
 {
@@ -1195,7 +1360,7 @@ csiparse(void)
 {
 	char *p = csiescseq.buf, *np;
 	long int v;
-	int sep = ';'; /* colon or semi-colon, but not both */
+	int issub = 0; /* current arg follows a colon */
 
 	csiescseq.narg = 0;
 	if (*p == '?') {
@@ -1211,12 +1376,12 @@ csiparse(void)
 			v = 0;
 		if (v == LONG_MAX || v == LONG_MIN)
 			v = -1;
+		csiescseq.sub[csiescseq.narg] = issub;
 		csiescseq.arg[csiescseq.narg++] = v;
 		p = np;
-		if (sep == ';' && *p == ':')
-			sep = ':'; /* allow override to colon once */
-		if (*p != sep || csiescseq.narg == ESC_ARG_SIZ)
+		if ((*p != ';' && *p != ':') || csiescseq.narg == ESC_ARG_SIZ)
 			break;
+		issub = *p == ':';
 		p++;
 	}
 	csiescseq.mode[0] = *p++;
@@ -1308,6 +1473,7 @@ tclearregion(int x1, int y1, int x2, int y2)
 			gp->fg = term.c.attr.fg;
 			gp->bg = term.c.attr.bg;
 			gp->mode = 0;
+			gp->ul = 0;
 			gp->u = ' ';
 		}
 	}
@@ -1411,8 +1577,31 @@ tdefcolor(const int *attr, int *npar, int l)
 	return idx;
 }
 
+/*
+ * Like tdefcolor(), but also understands the colon form with an optional
+ * colour space id: 38:2:r:g:b and 38:2:<colourspace>:r:g:b.
+ */
+static int32_t
+tdefcolorx(const int *attr, const char *sub, int *npar, int l)
+{
+	int tmp[5], k = 0, n, i = *npar;
+
+	for (n = 0; i + 1 + n < l && sub[i + 1 + n]; n++)
+		;
+	if (n >= 5 && attr[i + 1] == 2) { /* skip the colour space id */
+		tmp[0] = attr[i];
+		tmp[1] = 2;
+		tmp[2] = attr[i + 3];
+		tmp[3] = attr[i + 4];
+		tmp[4] = attr[i + 5];
+		*npar += 5;
+		return tdefcolor(tmp, &k, 5);
+	}
+	return tdefcolor(attr, npar, l);
+}
+
 void
-tsetattr(const int *attr, int l)
+tsetattr(const int *attr, const char *sub, int l)
 {
 	int i;
 	int32_t idx;
@@ -1425,12 +1614,14 @@ tsetattr(const int *attr, int l)
 				ATTR_FAINT      |
 				ATTR_ITALIC     |
 				ATTR_UNDERLINE  |
+				ATTR_USTYLE     |
 				ATTR_BLINK      |
 				ATTR_REVERSE    |
 				ATTR_INVISIBLE  |
 				ATTR_STRUCK     );
 			term.c.attr.fg = defaultfg;
 			term.c.attr.bg = defaultbg;
+			term.c.attr.ul = 0;
 			break;
 		case 1:
 			term.c.attr.mode |= ATTR_BOLD;
@@ -1441,8 +1632,28 @@ tsetattr(const int *attr, int l)
 		case 3:
 			term.c.attr.mode |= ATTR_ITALIC;
 			break;
-		case 4:
+		case 4: /* 4 or 4:<style> */
+			term.c.attr.mode &= ~ATTR_USTYLE;
 			term.c.attr.mode |= ATTR_UNDERLINE;
+			if (i + 1 < l && sub[i + 1]) {
+				switch (attr[++i]) {
+				case 0:
+					term.c.attr.mode &= ~ATTR_UNDERLINE;
+					break;
+				case 2:
+					term.c.attr.mode |= ATTR_UDOUBLE;
+					break;
+				case 3:
+					term.c.attr.mode |= ATTR_UCURLY;
+					break;
+				case 4:
+					term.c.attr.mode |= ATTR_UDOTTED;
+					break;
+				case 5:
+					term.c.attr.mode |= ATTR_UDASHED;
+					break;
+				}
+			}
 			break;
 		case 5: /* slow blink */
 			/* FALLTHROUGH */
@@ -1465,7 +1676,7 @@ tsetattr(const int *attr, int l)
 			term.c.attr.mode &= ~ATTR_ITALIC;
 			break;
 		case 24:
-			term.c.attr.mode &= ~ATTR_UNDERLINE;
+			term.c.attr.mode &= ~(ATTR_UNDERLINE | ATTR_USTYLE);
 			break;
 		case 25:
 			term.c.attr.mode &= ~ATTR_BLINK;
@@ -1480,24 +1691,25 @@ tsetattr(const int *attr, int l)
 			term.c.attr.mode &= ~ATTR_STRUCK;
 			break;
 		case 38:
-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
+			if ((idx = tdefcolorx(attr, sub, &i, l)) >= 0)
 				term.c.attr.fg = idx;
 			break;
 		case 39: /* set foreground color to default */
 			term.c.attr.fg = defaultfg;
 			break;
 		case 48:
-			if ((idx = tdefcolor(attr, &i, l)) >= 0)
+			if ((idx = tdefcolorx(attr, sub, &i, l)) >= 0)
 				term.c.attr.bg = idx;
 			break;
 		case 49: /* set background color to default */
 			term.c.attr.bg = defaultbg;
 			break;
-		case 58:
-			/* This starts a sequence to change the color of
-			 * "underline" pixels. We don't support that and
-			 * instead eat up a following "5;n" or "2;r;g;b". */
-			tdefcolor(attr, &i, l);
+		case 58: /* underline colour */
+			if ((idx = tdefcolorx(attr, sub, &i, l)) >= 0)
+				term.c.attr.ul = IS_TRUECOL(idx) ? idx : idx | UL_IDX;
+			break;
+		case 59: /* default underline colour */
+			term.c.attr.ul = 0;
 			break;
 		default:
 			if (BETWEEN(attr[i], 30, 37)) {
@@ -1840,7 +2052,7 @@ csihandle(void)
 		tsetmode(csiescseq.priv, 1, csiescseq.arg, csiescseq.narg);
 		break;
 	case 'm': /* SGR -- Terminal attribute (color) */
-		tsetattr(csiescseq.arg, csiescseq.narg);
+		tsetattr(csiescseq.arg, csiescseq.sub, csiescseq.narg);
 		break;
 	case 'n': /* DSR -- Device Status Report */
 		switch (csiescseq.arg[0]) {

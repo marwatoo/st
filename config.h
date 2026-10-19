@@ -9,7 +9,7 @@ static char *font = "JetBrainsMonoNL NFP:size=14:antialias=true:autohint=true:st
 /* Spare fonts */
 static char *font2[] = {
 	"Monospace:size=14:antialias=true:autohint=true:style=Bold", // this fonts supports arabic the best with st
-	"Symbola:size=14:antialias=true:autohint=true,style=Bold", 
+	"Symbola:size=14:antialias=true:autohint=true:style=Bold",
 };
 
 static int borderpx = 2;
@@ -38,6 +38,9 @@ char *utmp = NULL;
 char *scroll = NULL;
 char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 
+/* program that opens URLs (Ctrl+click on a URL, Ctrl+Shift+U for the last one) */
+static char *urlopener = "xdg-open";
+
 /* identification sequence returned in DA and DECID */
 char *vtiden = "\033[?6c";
 
@@ -50,7 +53,7 @@ static float chscale = 1.0;
  *
  * More advanced example: L" `'\"()[]{}"
  */
-wchar_t *worddelimiters = L" ";
+wchar_t *worddelimiters = L" \t`'\"()[]{}<>|,;";
 
 /* selection timeouts (in milliseconds) */
 static unsigned int doubleclicktimeout = 300;
@@ -141,49 +144,55 @@ static const char *colorname[] = {
     /* special colors */
     [256] = "#282a36", /* background */
     [257] = "#f8f8f2", /* foreground */
+    [258] = "#f8f8f2", /* cursor */
 
-	/* more colors can be added after 255 to use with DefaultXX */
-	"#cccccc",
-	"#555555",
-	"gray90", /* default foreground colour */
-	"black", /* default background colour */
-};
-
-
-/*
- * Light theme palette (used when a light system theme is detected, or after
- * toggling with the theme shortcut). The dark theme is simply the colorname[]
- * table above (including any Xresources overrides), so it is left untouched.
- * Only the first 16 colors, background (256) and foreground (257) are swapped.
- */
-static const char *lightcolorname[] = {
-    [0]  = "#1e1f29", /* black   */
-    [1]  = "#c4262e", /* red     */
-    [2]  = "#14710a", /* green   */
-    [3]  = "#846e15", /* yellow  */
-    [4]  = "#644ac9", /* blue    */
-    [5]  = "#a3144d", /* magenta */
-    [6]  = "#036a96", /* cyan    */
-    [7]  = "#5f6275", /* white (readable on light bg: used for italic etc) */
-
-    [8]  = "#6272a4", /* bright black */
-    [9]  = "#d6382f", /* bright red */
-    [10] = "#1f8a14", /* bright green */
-    [11] = "#9a7f10", /* bright yellow */
-    [12] = "#7a5ce0", /* bright blue */
-    [13] = "#c2216a", /* bright magenta */
-    [14] = "#0a82b0", /* bright cyan */
-    [15] = "#2b2d3a", /* bright white (dark so bold text stays visible) */
-
-    [256] = "#f8f8f2", /* background */
-    [257] = "#282a36", /* foreground */
+	/* more colors can be added after 258 to use with DefaultXX */
 };
 
 /*
- * Theme selection at startup: 0 = auto-detect, 1 = force dark, 2 = force light.
- * Can also be overridden with the ST_THEME=dark|light environment variable.
+ * Follow the GNOME light/dark preference
+ * (org.gnome.desktop.interface color-scheme). Set to 0 to always use the
+ * dark palette in colorname[] above.
  */
-static int themeinit = 0;
+static int followtheme = 1;
+
+/*
+ * Light variant of the palette above (Dracula "Alucard"-style), swapped in
+ * live when GNOME is set to light. Only the indices listed here change; the
+ * dark theme in colorname[] is left exactly as it is.
+ *
+ * Like most light schemes, the roles of the ANSI greys are kept rather than
+ * the literal colours: "white" (7, 15) stays the readable text colour and
+ * "black" (0, 8) stays the dark/dim surface colour, so programs written for
+ * dark terminals remain legible. The accents are darkened for contrast.
+ */
+static const char *colorname_light[] = {
+    /* 8 normal colors */
+    [0] = "#ffffff", /* black   */
+    [1] = "#cb3a2a", /* red     */
+    [2] = "#14710a", /* green   */
+    [3] = "#846e15", /* yellow  */
+    [4] = "#644ac9", /* blue    */
+    [5] = "#a3144d", /* magenta */
+    [6] = "#036a96", /* cyan    */
+    [7] = "#44475a", /* white   */
+
+    /* 8 bright colors */
+    [8]  = "#cfcfde", /* black   */
+    [9]  = "#cb3a2a", /* red     */
+    [10] = "#14710a", /* green   */
+    [11] = "#846e15", /* yellow  */
+    [12] = "#644ac9", /* blue    */
+    [13] = "#a3144d", /* magenta */
+    [14] = "#036a96", /* cyan    */
+    [15] = "#000000", /* white   */
+
+    /* special colors */
+    [256] = "#fffbeb", /* background */
+    [257] = "#1f1f1f", /* foreground */
+    [258] = "#1f1f1f", /* cursor */
+};
+
 
 /*
  * Default colors (colorname index)
@@ -191,16 +200,8 @@ static int themeinit = 0;
  */
 unsigned int defaultfg = 257;
 unsigned int defaultbg = 256;
-unsigned int defaultcs = 257;
-static unsigned int defaultrcs = 257;
-
-/*
- * Colors used, when the specific fg == defaultfg. So in reverse mode this
- * will reverse too. Another logic would only make the simple feature too
- * complex.
- */
-unsigned int defaultitalic = 7;
-unsigned int defaultunderline = 7;
+unsigned int defaultcs = 258;
+static unsigned int defaultrcs = 258;
 
 /*
  * Default shape of cursor
@@ -239,10 +240,11 @@ ResourcePref resources[] = {
 		{ "color13",      STRING,  &colorname[13] },
 		{ "color14",      STRING,  &colorname[14] },
 		{ "color15",      STRING,  &colorname[15] },
-		{ "background",   STRING,  &colorname[259] },
-		{ "foreground",   STRING,  &colorname[258] },
-		{ "cursorColor",  STRING,  &colorname[256] },
+		{ "background",   STRING,  &colorname[256] },
+		{ "foreground",   STRING,  &colorname[257] },
+		{ "cursorColor",  STRING,  &colorname[258] },
 		{ "termname",     STRING,  &termname },
+		{ "followtheme",  INTEGER, &followtheme },
 		{ "shell",        STRING,  &shell },
 		{ "minlatency",   INTEGER, &minlatency },
 		{ "maxlatency",   INTEGER, &maxlatency },
@@ -284,6 +286,7 @@ static MouseShortcut mshortcuts[] = {
 	/* mask                 button   function        argument       release */
 	{ ShiftMask,            Button4, kscrollup,      {.i = 1} },
 	{ ShiftMask,            Button5, kscrolldown,    {.i = 1} },
+	{ ControlMask,          Button1, urlopen,        {.i = 0} },
 	{ XK_ANY_MOD,           Button2, selpaste,       {.i = 0},      1 },
 	{ ShiftMask,            Button4, ttysend,        {.s = "\033[5;2~"} },
 	{ XK_ANY_MOD,           Button4, ttysend,        {.s = "\031"} },
@@ -303,16 +306,15 @@ static Shortcut shortcuts[] = {
 	{ ControlMask,          XK_Print,       toggleprinter,  {.i =  0} },
 	{ ShiftMask,            XK_Print,       printscreen,    {.i =  0} },
 	{ XK_ANY_MOD,           XK_Print,       printsel,       {.i =  0} },
-	{ ControlMask,          XK_equal,     	zoom,           {.f = +1} },
-	{ ControlMask,          XK_minus,  		zoom,           {.f = -1} },
+	{ TERMMOD,              XK_Prior,       zoom,           {.f = +1} },
+	{ TERMMOD,              XK_Next,        zoom,           {.f = -1} },
 	{ TERMMOD,              XK_plus,        zoomreset,      {.f =  0} },
 	{ TERMMOD,              XK_C,           clipcopy,       {.i =  0} },
 	{ TERMMOD,              XK_V,           clippaste,      {.i =  0} },
 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
+	{ TERMMOD,              XK_U,           urlopen,        {.i =  1} },
 	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
-	{ TERMMOD,              XK_T,           toggletheme,    {.i =  0} },
-	{ TERMMOD,              XK_A,           autotheme,      {.i =  0} },
 	{ ACMPL_MOD,            XK_slash,       autocomplete,   { .i = ACMPL_WORD        } },
 	{ ACMPL_MOD,            XK_period,      autocomplete,   { .i = ACMPL_FUZZY_WORD  } },
 	{ ACMPL_MOD,            XK_comma,       autocomplete,   { .i = ACMPL_FUZZY       } },

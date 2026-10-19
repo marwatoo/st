@@ -4,9 +4,12 @@
 #include <limits.h>
 #include <locale.h>
 #include <signal.h>
-#include <stdio.h>
-#include <strings.h>
 #include <sys/select.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 #include <libgen.h>
@@ -74,14 +77,10 @@ static void clippaste(const Arg *);
 static void numlock(const Arg *);
 static void selpaste(const Arg *);
 static void zoom(const Arg *);
+static void urlopen(const Arg *);
 static void zoomabs(const Arg *);
 static void zoomreset(const Arg *);
 static void ttysend(const Arg *);
-static void toggletheme(const Arg *);
-static void autotheme(const Arg *);
-static int detecttheme(void);
-static void applytheme(int);
-static volatile sig_atomic_t themesig = 0;
 
 /* config.h for applying patches and the configuration. */
 #include "config.h"
@@ -211,6 +210,7 @@ static void resize(XEvent *);
 static void focus(XEvent *);
 static uint buttonmask(uint);
 static int mouseaction(XEvent *, uint);
+static int mousecol, mouserow; /* cell under the pointer, for mouse shortcuts */
 static void brelease(XEvent *);
 static void bpress(XEvent *);
 static void bmotion(XEvent *);
@@ -493,6 +493,9 @@ mouseaction(XEvent *e, uint release)
 
 	/* ignore Button<N>mask for Button<N> - it's set on release */
 	uint state = e->xbutton.state & ~buttonmask(e->xbutton.button);
+
+	mousecol = evcol(e);
+	mouserow = evrow(e);
 
 	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
 		if (ms->release == release &&
@@ -996,8 +999,8 @@ xclear(int x1, int y1, int x2, int y2)
 void
 xhints(void)
 {
-	XClassHint class = {opt_name ? opt_name : "stterm",
-	                    opt_class ? opt_class : "stterm"};
+	XClassHint class = {opt_name ? opt_name : "st",
+	                    opt_class ? opt_class : "St"};
 	XWMHints wm = {.flags = InputHint, .input = 1};
 	XSizeHints *sizeh;
 
@@ -1411,6 +1414,29 @@ xicdestroy(XIC xim, XPointer client, XPointer call)
 	return 1;
 }
 
+static Cursor mousecursor;
+
+/* (re)colour the pointer from colorname[mousefg] / colorname[mousebg] */
+static void
+xmousecolors(void)
+{
+	XColor xmousefg, xmousebg;
+
+	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
+		xmousefg.red   = 0xffff;
+		xmousefg.green = 0xffff;
+		xmousefg.blue  = 0xffff;
+	}
+
+	if (XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xmousebg) == 0) {
+		xmousebg.red   = 0x0000;
+		xmousebg.green = 0x0000;
+		xmousebg.blue  = 0x0000;
+	}
+
+	XRecolorCursor(xw.dpy, mousecursor, &xmousefg, &xmousebg);
+}
+
 void
 xinit(int cols, int rows)
 {
@@ -1418,7 +1444,6 @@ xinit(int cols, int rows)
 	Cursor cursor;
 	Window parent, root;
 	pid_t thispid = getpid();
-	XColor xmousefg, xmousebg;
 
 	xw.scr = XDefaultScreen(xw.dpy);
 	xw.vis = XDefaultVisual(xw.dpy, xw.scr);
@@ -1489,19 +1514,8 @@ xinit(int cols, int rows)
 	cursor = XCreateFontCursor(xw.dpy, mouseshape);
 	XDefineCursor(xw.dpy, xw.win, cursor);
 
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xmousefg) == 0) {
-		xmousefg.red   = 0xffff;
-		xmousefg.green = 0xffff;
-		xmousefg.blue  = 0xffff;
-	}
-
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xmousebg) == 0) {
-		xmousebg.red   = 0x0000;
-		xmousebg.green = 0x0000;
-		xmousebg.blue  = 0x0000;
-	}
-
-	XRecolorCursor(xw.dpy, cursor, &xmousefg, &xmousebg);
+	mousecursor = cursor;
+	xmousecolors();
 
 	xw.xembed = XInternAtom(xw.dpy, "_XEMBED", False);
 	xw.wmdeletewin = XInternAtom(xw.dpy, "WM_DELETE_WINDOW", False);
@@ -1680,14 +1694,58 @@ xmakeglyphfontspecs(XftGlyphFontSpec *specs, const Glyph *glyphs, int len, int x
 	return numspecs;
 }
 
+/*
+ * Draw the underline of a run of cells in the given style. All shapes are
+ * built from rectangles inside the cell, so they stay crisp at any size.
+ */
+static void
+xdrawunderline(Color *col, int winx, int winy, int width, ushort mode)
+{
+	int u = MAX(dc.font.underline_h, 1);
+	int y = winy + (dc.font.ascent + dc.font.underline_y) * chscale;
+	int bottom = winy + win.ch, i, period, half, amp, off, offn, lo, hi, x;
+
+	if (mode & ATTR_UDOUBLE) {
+		y = MIN(y, bottom - 3 * u);
+		XftDrawRect(xw.draw, col, winx, y, width, u);
+		XftDrawRect(xw.draw, col, winx, y + 2 * u, width, u);
+	} else if (mode & ATTR_UCURLY) {
+		period = MAX(win.cw, 2);
+		half = MAX(period / 2, 1);
+		amp = MIN(bottom - y - u, 3 * u);
+		if (amp < 0)
+			amp = 0;
+		for (i = 0; i < width; i++) {
+			x = i % period;
+			off = (x < half ? x : period - x) * amp / half;
+			x = (i + 1) % period;
+			offn = (x < half ? x : period - x) * amp / half;
+			lo = MIN(off, offn);
+			hi = MAX(off, offn);
+			XftDrawRect(xw.draw, col, winx + i, y + lo, 1,
+					hi - lo + u);
+		}
+	} else if (mode & ATTR_UDOTTED) {
+		for (i = 0; i < width; i += 2 * u)
+			XftDrawRect(xw.draw, col, winx + i, y,
+					MIN(u, width - i), u);
+	} else if (mode & ATTR_UDASHED) {
+		for (i = 0; i < width; i += win.cw)
+			XftDrawRect(xw.draw, col, winx + i, y,
+					MIN(win.cw * 3 / 4, width - i), u);
+	} else {
+		XftDrawRect(xw.draw, col, winx, y, width, dc.font.underline_h);
+	}
+}
+
 void
 xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, int y)
 {
 	int charlen = len * ((base.mode & ATTR_WIDE) ? 2 : 1);
 	int winx = borderpx + x * win.cw, winy = borderpx + y * win.ch,
 	    width = charlen * win.cw;
-	Color *fg, *bg, *temp, revfg, revbg, truefg, truebg;
-	XRenderColor colfg, colbg;
+	Color *fg, *bg, *temp, *ulcol, revfg, revbg, truefg, truebg, trueul;
+	XRenderColor colfg, colbg, colul;
 	XRectangle r;
 
 	/* Fallback on color display for attributes not supported by the font */
@@ -1802,9 +1860,21 @@ xdrawglyphfontspecs(const XftGlyphFontSpec *specs, Glyph base, int len, int x, i
 
 	/* Render underline and strikethrough. */
 	if (base.mode & ATTR_UNDERLINE) {
-		XftDrawRect(xw.draw, fg, winx,
-				winy + (dc.font.ascent + dc.font.underline_y) * chscale,
-				width, dc.font.underline_h);
+		ulcol = fg;
+		if (base.ul && fg != bg) { /* SGR 58 underline colour */
+			if (base.ul & UL_IDX) {
+				ulcol = &dc.col[base.ul & 0xff];
+			} else if (IS_TRUECOL(base.ul)) {
+				colul.alpha = 0xffff;
+				colul.red = TRUERED(base.ul);
+				colul.green = TRUEGREEN(base.ul);
+				colul.blue = TRUEBLUE(base.ul);
+				XftColorAllocValue(xw.dpy, xw.vis, xw.cmap,
+						&colul, &trueul);
+				ulcol = &trueul;
+			}
+		}
+		xdrawunderline(ulcol, winx, winy, width, base.mode);
 	}
 
 	if (base.mode & ATTR_STRUCK) {
@@ -1843,7 +1913,7 @@ xdrawcursor(int cx, int cy, Glyph g, int ox, int oy, Glyph og)
 	/*
 	 * Select the right color for the right mode.
 	 */
-	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_STRUCK|ATTR_WIDE;
+	g.mode &= ATTR_BOLD|ATTR_ITALIC|ATTR_UNDERLINE|ATTR_USTYLE|ATTR_STRUCK|ATTR_WIDE;
 
 	if (IS_SET(MODE_REVERSE)) {
 		g.mode |= ATTR_REVERSE;
@@ -2382,6 +2452,198 @@ resize(XEvent *e)
 	cresize(e->xconfigure.width, e->xconfigure.height);
 }
 
+/*
+ * Follow the GNOME light/dark preference.
+ *
+ * At startup the current org.gnome.desktop.interface color-scheme is read
+ * with gsettings(1) and the matching palette is selected. A `gsettings
+ * monitor` child then reports changes and the palette is swapped live. If
+ * gsettings is missing or the key does not exist, nothing happens and st
+ * keeps the colours from config.h, so this is harmless on other desktops.
+ */
+static int themefd = -1;   /* read end of the gsettings monitor pipe */
+static pid_t themepid = -1;
+static int themedark = -1; /* -1 unknown, 0 light, 1 dark */
+static const char *colorname_dark[LEN(colorname_light)];
+typedef char themecheck[LEN(colorname) >= LEN(colorname_light) ? 1 : -1];
+
+/* parse a gsettings value: 1 for dark, 0 for light, -1 if not a value */
+static int
+themeparse(const char *s)
+{
+	/* values look like 'default', 'prefer-dark' or 'prefer-light' */
+	if (!strchr(s, '\''))
+		return -1;
+	return strstr(s, "dark") != NULL;
+}
+
+static int
+themequery(void)
+{
+	char buf[128];
+	FILE *f;
+	int dark = -1;
+
+	f = popen("gsettings get org.gnome.desktop.interface color-scheme"
+	          " 2>/dev/null", "r");
+	if (!f)
+		return -1;
+	if (fgets(buf, sizeof(buf), f))
+		dark = themeparse(buf);
+	pclose(f);
+	return dark;
+}
+
+static void
+themeapply(int dark)
+{
+	size_t i;
+
+	for (i = 0; i < LEN(colorname_light); i++)
+		if (colorname_light[i])
+			colorname[i] = dark ? colorname_dark[i] : colorname_light[i];
+	themedark = dark;
+}
+
+/* switch palette of an already open window */
+static void
+themechange(int dark)
+{
+	themeapply(dark);
+	xloadcols();
+	xmousecolors();
+	XSetWindowBackground(xw.dpy, xw.win, dc.col[defaultbg].pixel);
+	XSetForeground(xw.dpy, dc.gc,
+			dc.col[IS_SET(MODE_REVERSE) ? defaultfg : defaultbg].pixel);
+	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
+	redraw();
+}
+
+/* the monitor pipe is readable: read its lines, apply the newest value */
+static void
+themeevent(void)
+{
+	static char buf[256];
+	static size_t len;
+	char *nl;
+	ssize_t n;
+	int dark = -1, d;
+
+	n = read(themefd, buf + len, sizeof(buf) - len - 1);
+	if (n < 0 && (errno == EAGAIN || errno == EINTR))
+		return;
+	if (n <= 0) { /* monitor went away: stop following, keep the colours */
+		close(themefd);
+		themefd = -1;
+		kill(themepid, SIGTERM); /* no-op if it already exited */
+		waitpid(themepid, NULL, 0);
+		themepid = -1;
+		return;
+	}
+	len += n;
+
+	while ((nl = memchr(buf, '\n', len))) {
+		*nl = '\0';
+		if ((d = themeparse(buf)) >= 0)
+			dark = d;
+		len -= nl + 1 - buf;
+		memmove(buf, nl + 1, len);
+	}
+	if (len >= sizeof(buf) - 1) /* overlong line, drop it */
+		len = 0;
+
+	if (dark >= 0 && dark != themedark)
+		themechange(dark);
+}
+
+/* call after config_init() and before xinit() */
+static void
+themeinit(void)
+{
+	int fds[2], nullfd, dark;
+
+	if (!followtheme)
+		return;
+
+	/* keep the dark palette, including Xresources overrides */
+	memcpy(colorname_dark, colorname, sizeof(colorname_dark));
+
+	if ((dark = themequery()) < 0)
+		return;
+	themeapply(dark);
+
+	if (pipe(fds) < 0)
+		return;
+	switch ((themepid = fork())) {
+	case -1:
+		close(fds[0]);
+		close(fds[1]);
+		themepid = -1;
+		return;
+	case 0:
+		close(fds[0]);
+		dup2(fds[1], STDOUT_FILENO);
+		close(fds[1]);
+		if ((nullfd = open("/dev/null", O_RDWR)) >= 0) {
+			dup2(nullfd, STDIN_FILENO);
+			dup2(nullfd, STDERR_FILENO);
+			if (nullfd > STDERR_FILENO)
+				close(nullfd);
+		}
+#ifdef __linux__
+		/* don't leave the monitor behind when st exits */
+		prctl(PR_SET_PDEATHSIG, SIGTERM);
+#endif
+		execlp("gsettings", "gsettings", "monitor",
+		       "org.gnome.desktop.interface", "color-scheme",
+		       (char *)NULL);
+		_exit(1);
+	}
+	close(fds[1]);
+	fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+	themefd = fds[0];
+}
+
+/*
+ * Open a URL from the screen with urlopener. arg->i == 0: URL under the
+ * mouse pointer (mouse shortcut), otherwise the last URL on the screen.
+ * The opener is started detached and without a shell, so the URL is never
+ * interpreted by one.
+ */
+void
+urlopen(const Arg *arg)
+{
+	char *url;
+	pid_t p;
+	int fd, nullfd;
+
+	url = arg->i ? tgeturl(0, -1) : tgeturl(mousecol, mouserow);
+	if (!url)
+		return;
+
+	switch ((p = fork())) {
+	case -1:
+		break;
+	case 0:
+		if (fork() != 0) /* double fork: nobody has to wait for it */
+			_exit(0);
+		setsid();
+		if ((nullfd = open("/dev/null", O_RDWR)) >= 0) {
+			dup2(nullfd, STDIN_FILENO);
+			dup2(nullfd, STDOUT_FILENO);
+			dup2(nullfd, STDERR_FILENO);
+		}
+		for (fd = STDERR_FILENO + 1; fd < 256; fd++)
+			close(fd);
+		execlp(urlopener, urlopener, url, (char *)NULL);
+		_exit(1);
+	default:
+		waitpid(p, NULL, 0);
+	}
+	free(url);
+}
+
 void
 run(void)
 {
@@ -2415,6 +2677,8 @@ run(void)
 		FD_ZERO(&rfd);
 		FD_SET(ttyfd, &rfd);
 		FD_SET(xfd, &rfd);
+		if (themefd >= 0)
+			FD_SET(themefd, &rfd);
 
 		if (XPending(xw.dpy))
 			timeout = 0;  /* existing events might not set xfd */
@@ -2423,20 +2687,18 @@ run(void)
 		seltv.tv_nsec = 1E6 * (timeout - 1E3 * seltv.tv_sec);
 		tv = timeout >= 0 ? &seltv : NULL;
 
-		if (pselect(MAX(xfd, ttyfd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
-			if (errno == EINTR) {
-				if (themesig) {
-					themesig = 0;
-					applytheme(detecttheme());
-				}
+		if (pselect(MAX(MAX(xfd, ttyfd), themefd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
+			if (errno == EINTR)
 				continue;
-			}
 			die("select failed: %s\n", strerror(errno));
 		}
 		clock_gettime(CLOCK_MONOTONIC, &now);
 
 		if (FD_ISSET(ttyfd, &rfd))
 			ttyread();
+
+		if (themefd >= 0 && FD_ISSET(themefd, &rfd))
+			themeevent();
 
 		xev = 0;
 		while (XPending(xw.dpy)) {
@@ -2487,161 +2749,6 @@ run(void)
 		draw();
 		XFlush(xw.dpy);
 		drawing = 0;
-	}
-}
-
-/* ---- light/dark theme support ---- */
-static const char *darkcolorname[258];  /* snapshot taken after config_init */
-static int curlight = 0;
-
-static int
-run_matches(const char *cmd, const char *needle)
-{
-	char buf[256];
-	FILE *f;
-	int found = 0;
-
-	if (!(f = popen(cmd, "r")))
-		return 0;
-	while (fgets(buf, sizeof(buf), f))
-		if (strstr(buf, needle))
-			found = 1;
-	pclose(f);
-	return found;
-}
-
-/* returns 1 for light, 0 for dark */
-static int
-detecttheme(void)
-{
-	const char *e;
-	char path[512], line[256];
-	FILE *f;
-
-	if ((e = getenv("ST_THEME"))) {
-		if (!strcasecmp(e, "light"))
-			return 1;
-		if (!strcasecmp(e, "dark"))
-			return 0;
-	}
-	/* freedesktop/GNOME color-scheme preference */
-	if (run_matches("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null",
-	                "prefer-dark"))
-		return 0;
-	if (run_matches("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null",
-	                "prefer-light"))
-		return 1;
-	if (run_matches("gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null",
-	                "-dark") ||
-	    run_matches("gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null",
-	                "-Dark"))
-		return 0;
-	/* GTK3 settings.ini */
-	if ((e = getenv("XDG_CONFIG_HOME")))
-		snprintf(path, sizeof(path), "%s/gtk-3.0/settings.ini", e);
-	else if ((e = getenv("HOME")))
-		snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini", e);
-	else
-		path[0] = '\0';
-	if (path[0] && (f = fopen(path, "r"))) {
-		int dark = -1;
-		while (fgets(line, sizeof(line), f)) {
-			if (strstr(line, "gtk-application-prefer-dark-theme")) {
-				dark = strchr(line, '1') || strstr(line, "true");
-				break;
-			}
-			if (strstr(line, "gtk-theme-name") &&
-			    (strstr(line, "dark") || strstr(line, "Dark")))
-				dark = 1;
-		}
-		fclose(f);
-		if (dark >= 0)
-			return !dark;
-	}
-	/* KDE Plasma */
-	if (run_matches("kreadconfig5 --group General --key ColorScheme 2>/dev/null",
-	                "Dark") ||
-	    run_matches("kreadconfig6 --group General --key ColorScheme 2>/dev/null",
-	                "Dark"))
-		return 0;
-	/* nothing found: keep the original (dark) look */
-	return 0;
-}
-
-static void
-applytheme(int light)
-{
-	int i, idx[18];
-	XColor xfg, xbg;
-	Cursor cur;
-
-	for (i = 0; i < 16; i++)
-		idx[i] = i;
-	idx[16] = 256;
-	idx[17] = 257;
-	for (i = 0; i < 18; i++)
-		colorname[idx[i]] = light ? lightcolorname[idx[i]]
-		                          : darkcolorname[idx[i]];
-	curlight = light;
-
-	xloadcols();
-
-	XSetWindowBackground(xw.dpy, xw.win, dc.col[defaultbg].pixel);
-	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
-
-	/* mouse pointer colors follow the palette */
-	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xfg) &&
-	    XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xbg)) {
-		cur = XCreateFontCursor(xw.dpy, mouseshape);
-		XRecolorCursor(xw.dpy, cur, &xfg, &xbg);
-		XDefineCursor(xw.dpy, xw.win, cur);
-		XFreeCursor(xw.dpy, cur);
-	}
-
-	redraw();
-}
-
-void
-toggletheme(const Arg *dummy)
-{
-	applytheme(!curlight);
-}
-
-void
-autotheme(const Arg *dummy)
-{
-	applytheme(detecttheme());
-}
-
-static void
-themesighandler(int sig)
-{
-	themesig = 1;
-}
-
-static void
-themesetup(void)
-{
-	int i, light;
-	for (i = 0; i < 16; i++)
-		darkcolorname[i] = colorname[i];
-	darkcolorname[256] = colorname[256];
-	darkcolorname[257] = colorname[257];
-
-	if (themeinit == 1)
-		light = 0;
-	else if (themeinit == 2)
-		light = 1;
-	else
-		light = detecttheme();
-	if (light)
-		applytheme(1);
-	{
-		struct sigaction sa;
-		memset(&sa, 0, sizeof(sa));
-		sa.sa_handler = themesighandler;
-		sigemptyset(&sa.sa_mask);
-		sigaction(SIGUSR1, &sa, NULL);
 	}
 }
 
@@ -2767,7 +2874,7 @@ run:
 		opt_cmd = argv;
 
 	if (!opt_title)
-		opt_title = (opt_line || !opt_cmd) ? "stterm" : opt_cmd[0];
+		opt_title = (opt_line || !opt_cmd) ? "st" : opt_cmd[0];
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
@@ -2776,13 +2883,13 @@ run:
 		die("Can't open display\n");
 
 	config_init();
+	themeinit();
 	cols = MAX(cols, 1);
 	rows = MAX(rows, 1);
 	tnew(cols, rows);
 	xinit(cols, rows);
 	xsetenv();
 	selinit();
-	themesetup();
 	run();
 
 	return 0;
