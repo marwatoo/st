@@ -1,0 +1,265 @@
+diff --git a/config.h b/config.h
+index bf79a4c..4d299cc 100644
+--- a/config.h
++++ b/config.h
+@@ -150,6 +150,41 @@ static const char *colorname[] = {
+ };
+ 
+ 
++/*
++ * Light theme palette (used when a light system theme is detected, or after
++ * toggling with the theme shortcut). The dark theme is simply the colorname[]
++ * table above (including any Xresources overrides), so it is left untouched.
++ * Only the first 16 colors, background (256) and foreground (257) are swapped.
++ */
++static const char *lightcolorname[] = {
++    [0]  = "#1e1f29", /* black   */
++    [1]  = "#c4262e", /* red     */
++    [2]  = "#14710a", /* green   */
++    [3]  = "#846e15", /* yellow  */
++    [4]  = "#644ac9", /* blue    */
++    [5]  = "#a3144d", /* magenta */
++    [6]  = "#036a96", /* cyan    */
++    [7]  = "#5f6275", /* white (readable on light bg: used for italic etc) */
++
++    [8]  = "#6272a4", /* bright black */
++    [9]  = "#d6382f", /* bright red */
++    [10] = "#1f8a14", /* bright green */
++    [11] = "#9a7f10", /* bright yellow */
++    [12] = "#7a5ce0", /* bright blue */
++    [13] = "#c2216a", /* bright magenta */
++    [14] = "#0a82b0", /* bright cyan */
++    [15] = "#2b2d3a", /* bright white (dark so bold text stays visible) */
++
++    [256] = "#f8f8f2", /* background */
++    [257] = "#282a36", /* foreground */
++};
++
++/*
++ * Theme selection at startup: 0 = auto-detect, 1 = force dark, 2 = force light.
++ * Can also be overridden with the ST_THEME=dark|light environment variable.
++ */
++static int themeinit = 0;
++
+ /*
+  * Default colors (colorname index)
+  * foreground, background, cursor
+@@ -276,6 +311,8 @@ static Shortcut shortcuts[] = {
+ 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
+ 	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
+ 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
++	{ TERMMOD,              XK_T,           toggletheme,    {.i =  0} },
++	{ TERMMOD,              XK_A,           autotheme,      {.i =  0} },
+ 	{ ACMPL_MOD,            XK_slash,       autocomplete,   { .i = ACMPL_WORD        } },
+ 	{ ACMPL_MOD,            XK_period,      autocomplete,   { .i = ACMPL_FUZZY_WORD  } },
+ 	{ ACMPL_MOD,            XK_comma,       autocomplete,   { .i = ACMPL_FUZZY       } },
+diff --git a/x.c b/x.c
+index d3eebe6..8441740 100644
+--- a/x.c
++++ b/x.c
+@@ -4,6 +4,8 @@
+ #include <limits.h>
+ #include <locale.h>
+ #include <signal.h>
++#include <stdio.h>
++#include <strings.h>
+ #include <sys/select.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -75,6 +77,11 @@ static void zoom(const Arg *);
+ static void zoomabs(const Arg *);
+ static void zoomreset(const Arg *);
+ static void ttysend(const Arg *);
++static void toggletheme(const Arg *);
++static void autotheme(const Arg *);
++static int detecttheme(void);
++static void applytheme(int);
++static volatile sig_atomic_t themesig = 0;
+ 
+ /* config.h for applying patches and the configuration. */
+ #include "config.h"
+@@ -2417,8 +2424,13 @@ run(void)
+ 		tv = timeout >= 0 ? &seltv : NULL;
+ 
+ 		if (pselect(MAX(xfd, ttyfd)+1, &rfd, NULL, NULL, tv, NULL) < 0) {
+-			if (errno == EINTR)
++			if (errno == EINTR) {
++				if (themesig) {
++					themesig = 0;
++					applytheme(detecttheme());
++				}
+ 				continue;
++			}
+ 			die("select failed: %s\n", strerror(errno));
+ 		}
+ 		clock_gettime(CLOCK_MONOTONIC, &now);
+@@ -2478,6 +2490,161 @@ run(void)
+ 	}
+ }
+ 
++/* ---- light/dark theme support ---- */
++static const char *darkcolorname[258];  /* snapshot taken after config_init */
++static int curlight = 0;
++
++static int
++run_matches(const char *cmd, const char *needle)
++{
++	char buf[256];
++	FILE *f;
++	int found = 0;
++
++	if (!(f = popen(cmd, "r")))
++		return 0;
++	while (fgets(buf, sizeof(buf), f))
++		if (strstr(buf, needle))
++			found = 1;
++	pclose(f);
++	return found;
++}
++
++/* returns 1 for light, 0 for dark */
++static int
++detecttheme(void)
++{
++	const char *e;
++	char path[512], line[256];
++	FILE *f;
++
++	if ((e = getenv("ST_THEME"))) {
++		if (!strcasecmp(e, "light"))
++			return 1;
++		if (!strcasecmp(e, "dark"))
++			return 0;
++	}
++	/* freedesktop/GNOME color-scheme preference */
++	if (run_matches("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null",
++	                "prefer-dark"))
++		return 0;
++	if (run_matches("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null",
++	                "prefer-light"))
++		return 1;
++	if (run_matches("gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null",
++	                "-dark") ||
++	    run_matches("gsettings get org.gnome.desktop.interface gtk-theme 2>/dev/null",
++	                "-Dark"))
++		return 0;
++	/* GTK3 settings.ini */
++	if ((e = getenv("XDG_CONFIG_HOME")))
++		snprintf(path, sizeof(path), "%s/gtk-3.0/settings.ini", e);
++	else if ((e = getenv("HOME")))
++		snprintf(path, sizeof(path), "%s/.config/gtk-3.0/settings.ini", e);
++	else
++		path[0] = '\0';
++	if (path[0] && (f = fopen(path, "r"))) {
++		int dark = -1;
++		while (fgets(line, sizeof(line), f)) {
++			if (strstr(line, "gtk-application-prefer-dark-theme")) {
++				dark = strchr(line, '1') || strstr(line, "true");
++				break;
++			}
++			if (strstr(line, "gtk-theme-name") &&
++			    (strstr(line, "dark") || strstr(line, "Dark")))
++				dark = 1;
++		}
++		fclose(f);
++		if (dark >= 0)
++			return !dark;
++	}
++	/* KDE Plasma */
++	if (run_matches("kreadconfig5 --group General --key ColorScheme 2>/dev/null",
++	                "Dark") ||
++	    run_matches("kreadconfig6 --group General --key ColorScheme 2>/dev/null",
++	                "Dark"))
++		return 0;
++	/* nothing found: keep the original (dark) look */
++	return 0;
++}
++
++static void
++applytheme(int light)
++{
++	int i, idx[18];
++	XColor xfg, xbg;
++	Cursor cur;
++
++	for (i = 0; i < 16; i++)
++		idx[i] = i;
++	idx[16] = 256;
++	idx[17] = 257;
++	for (i = 0; i < 18; i++)
++		colorname[idx[i]] = light ? lightcolorname[idx[i]]
++		                          : darkcolorname[idx[i]];
++	curlight = light;
++
++	xloadcols();
++
++	XSetWindowBackground(xw.dpy, xw.win, dc.col[defaultbg].pixel);
++	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
++
++	/* mouse pointer colors follow the palette */
++	if (XParseColor(xw.dpy, xw.cmap, colorname[mousefg], &xfg) &&
++	    XParseColor(xw.dpy, xw.cmap, colorname[mousebg], &xbg)) {
++		cur = XCreateFontCursor(xw.dpy, mouseshape);
++		XRecolorCursor(xw.dpy, cur, &xfg, &xbg);
++		XDefineCursor(xw.dpy, xw.win, cur);
++		XFreeCursor(xw.dpy, cur);
++	}
++
++	redraw();
++}
++
++void
++toggletheme(const Arg *dummy)
++{
++	applytheme(!curlight);
++}
++
++void
++autotheme(const Arg *dummy)
++{
++	applytheme(detecttheme());
++}
++
++static void
++themesighandler(int sig)
++{
++	themesig = 1;
++}
++
++static void
++themesetup(void)
++{
++	int i, light;
++	for (i = 0; i < 16; i++)
++		darkcolorname[i] = colorname[i];
++	darkcolorname[256] = colorname[256];
++	darkcolorname[257] = colorname[257];
++
++	if (themeinit == 1)
++		light = 0;
++	else if (themeinit == 2)
++		light = 1;
++	else
++		light = detecttheme();
++	if (light)
++		applytheme(1);
++	{
++		struct sigaction sa;
++		memset(&sa, 0, sizeof(sa));
++		sa.sa_handler = themesighandler;
++		sigemptyset(&sa.sa_mask);
++		sigaction(SIGUSR1, &sa, NULL);
++	}
++}
++
+ int
+ resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst)
+ {
+@@ -2615,6 +2782,7 @@ run:
+ 	xinit(cols, rows);
+ 	xsetenv();
+ 	selinit();
++	themesetup();
+ 	run();
+ 
+ 	return 0;

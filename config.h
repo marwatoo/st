@@ -151,6 +151,41 @@ static const char *colorname[] = {
 
 
 /*
+ * Light theme palette (used when a light system theme is detected, or after
+ * toggling with the theme shortcut). The dark theme is simply the colorname[]
+ * table above (including any Xresources overrides), so it is left untouched.
+ * Only the first 16 colors, background (256) and foreground (257) are swapped.
+ */
+static const char *lightcolorname[] = {
+    [0]  = "#1e1f29", /* black   */
+    [1]  = "#c4262e", /* red     */
+    [2]  = "#14710a", /* green   */
+    [3]  = "#846e15", /* yellow  */
+    [4]  = "#644ac9", /* blue    */
+    [5]  = "#a3144d", /* magenta */
+    [6]  = "#036a96", /* cyan    */
+    [7]  = "#5f6275", /* white (readable on light bg: used for italic etc) */
+
+    [8]  = "#6272a4", /* bright black */
+    [9]  = "#d6382f", /* bright red */
+    [10] = "#1f8a14", /* bright green */
+    [11] = "#9a7f10", /* bright yellow */
+    [12] = "#7a5ce0", /* bright blue */
+    [13] = "#c2216a", /* bright magenta */
+    [14] = "#0a82b0", /* bright cyan */
+    [15] = "#2b2d3a", /* bright white (dark so bold text stays visible) */
+
+    [256] = "#f8f8f2", /* background */
+    [257] = "#282a36", /* foreground */
+};
+
+/*
+ * Theme selection at startup: 0 = auto-detect, 1 = force dark, 2 = force light.
+ * Can also be overridden with the ST_THEME=dark|light environment variable.
+ */
+static int themeinit = 0;
+
+/*
  * Default colors (colorname index)
  * foreground, background, cursor
  */
@@ -276,6 +311,8 @@ static Shortcut shortcuts[] = {
 	{ TERMMOD,              XK_Y,           selpaste,       {.i =  0} },
 	{ ShiftMask,            XK_Insert,      selpaste,       {.i =  0} },
 	{ TERMMOD,              XK_Num_Lock,    numlock,        {.i =  0} },
+	{ TERMMOD,              XK_T,           toggletheme,    {.i =  0} },
+	{ TERMMOD,              XK_A,           autotheme,      {.i =  0} },
 	{ ACMPL_MOD,            XK_slash,       autocomplete,   { .i = ACMPL_WORD        } },
 	{ ACMPL_MOD,            XK_period,      autocomplete,   { .i = ACMPL_FUZZY_WORD  } },
 	{ ACMPL_MOD,            XK_comma,       autocomplete,   { .i = ACMPL_FUZZY       } },
