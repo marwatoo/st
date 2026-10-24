@@ -999,8 +999,8 @@ xclear(int x1, int y1, int x2, int y2)
 void
 xhints(void)
 {
-	XClassHint class = {opt_name ? opt_name : "st",
-	                    opt_class ? opt_class : "St"};
+	XClassHint class = {opt_name ? opt_name : "stterm",
+	                    opt_class ? opt_class : "stterm"};
 	XWMHints wm = {.flags = InputHint, .input = 1};
 	XSizeHints *sizeh;
 
@@ -2765,9 +2765,9 @@ resource_load(XrmDatabase db, char *name, enum resource_type rtype, void *dst)
 	XrmValue ret;
 
 	snprintf(fullname, sizeof(fullname), "%s.%s",
-			opt_name ? opt_name : "st", name);
+			opt_name ? opt_name : "stterm", name);
 	snprintf(fullclass, sizeof(fullclass), "%s.%s",
-			opt_class ? opt_class : "St", name);
+			opt_class ? opt_class : "stterm", name);
 	fullname[sizeof(fullname) - 1] = fullclass[sizeof(fullclass) - 1] = '\0';
 
 	XrmGetResource(db, fullname, fullclass, &type, &ret);
@@ -2874,7 +2874,7 @@ run:
 		opt_cmd = argv;
 
 	if (!opt_title)
-		opt_title = (opt_line || !opt_cmd) ? "st" : opt_cmd[0];
+		opt_title = (opt_line || !opt_cmd) ? "stterm" : opt_cmd[0];
 
 	setlocale(LC_CTYPE, "");
 	XSetLocaleModifiers("");
